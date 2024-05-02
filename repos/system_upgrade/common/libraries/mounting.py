@@ -23,6 +23,8 @@ class MountingMode(object):
     """
     BIND = 'bind'
     """ Used for bind mounts """
+    RBIND = 'rbind'
+    """ Same as above, but recursively for sub mounts """
     OVERLAY = 'overlay'
     """ Used for overlayfs mounts """
     LOOP = 'loop'
@@ -31,6 +33,16 @@ class MountingMode(object):
     """ Used to mount specific filesystem types such as procfs, sysfs etc """
     NONE = 'none'
     """ Used when no actual mount call needs to be issued """
+
+
+class MountingPropagation(object):
+    """
+    MountingPropagation are types of mounts propagation supported by the library
+    """
+    PRIVATE = 'private'
+    """ Used for private propagation mounts """
+    SHARED = 'shared'
+    """ Used for shared propagation mounts """
 
 
 def _makedirs(path, mode=0o777, exists_ok=True):
@@ -293,11 +305,14 @@ class MountConfig(object):
 class MountingBase(object):
     """ Base class for all mount operations """
 
-    def __init__(self, source, target, mode, config=MountConfig.Mount):
+    def __init__(self, source, target, mode,
+                 config=MountConfig.Mount,
+                 propagation=MountingPropagation.SHARED):
         self._mode = mode
         self.source = source
         self.target = target
         self._config = config
+        self.propagation = propagation
         self.additional_directories = ()
 
     def _mount_options(self):
@@ -305,7 +320,17 @@ class MountingBase(object):
         Options to use with the mount call, individual implementations may override this function to return the
         correct parameters
         """
-        return ['-o', self._mode, self.source]
+        return [
+            '-o', self._mode,
+            '--make-' + self.propagation,
+            self.source
+        ]
+
+    def _umount_options(self):
+        """
+        Options to use with the umount call.
+        """
+        return ['-fl']
 
     def chroot(self):
         """ Create a ChrootActions instance for this mount """
@@ -323,7 +348,7 @@ class MountingBase(object):
         """ Cleanup operations """
         if os.path.exists(self.target) and os.path.ismount(self.target):
             try:
-                run(['umount', '-fl', self.target], split=False)
+                run(['umount'] + self._umount_options() + [self.target], split=False)
             except (OSError, CalledProcessError) as e:
                 api.current_logger().warning('Unmounting %s failed with: %s', self.target, str(e))
         for directory in itertools.chain(self.additional_directories, (self.target,)):
@@ -390,8 +415,24 @@ class LoopMount(MountingBase):
 class BindMount(MountingBase):
     """ Performs bind mounts """
 
-    def __init__(self, source, target, config=MountConfig.Mount):
-        super(BindMount, self).__init__(source=source, target=target, mode=MountingMode.BIND, config=config)
+    def __init__(self, source, target, config=MountConfig.Mount, mode=MountingMode.RBIND):
+        super(BindMount, self).__init__(source=source, target=target, mode=mode, config=config)
+
+    def _mount_options(self):
+        parent_options = super(BindMount, self)._mount_options()
+
+        if self._mode == MountingMode.RBIND:
+            # in order to detach structure from parent
+            # otherwise umount -R will affect source too
+            parent_options.append('--make-shared')
+
+        return parent_options
+
+    def _umount_options(self):
+        parent_umount_options = super(BindMount, self)._umount_options()
+        if self._mode == MountingMode.RBIND:
+            parent_umount_options.append('--recursive')
+        return parent_umount_options
 
 
 class TypedMount(MountingBase):
@@ -404,6 +445,7 @@ class TypedMount(MountingBase):
     def _mount_options(self):
         return [
             '-t', self.fstype,
+            '--make-' + self.propagation,
             self.source
         ]
 
@@ -421,5 +463,6 @@ class OverlayMount(MountingBase):
     def _mount_options(self):
         return [
             '-t', 'overlay', 'overlay2',
+            '--make-' + self.propagation,
             '-o', 'lowerdir={},upperdir={},workdir={}'.format(self.source, self._upper_dir, self._work_dir)
         ]
